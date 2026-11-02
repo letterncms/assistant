@@ -1,5 +1,6 @@
-import { eventStream, loadManifest, queryClient, run, t, CmsError, type SurfaceDocument, type SurfaceAction } from '@letterncms/sdk'
+import { eventStream, events, loadManifest, queryClient, run, t, CmsError, type SurfaceDocument, type SurfaceAction } from '@letterncms/sdk'
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { forget, messageContext, type SentItem } from './context'
 import { panel } from './store'
 
 export type ToolStatus = 'running' | 'ok' | 'error' | 'declined' | 'awaiting'
@@ -9,7 +10,7 @@ export type Part =
   | { type: 'thinking'; text: string }
   | { type: 'tool'; id: string; name: string; label: string; input?: unknown; status: ToolStatus; output?: string; surface?: SurfaceDocument; used?: boolean }
 
-export type Item = { role: 'user'; text: string; messageIndex?: number } | { role: 'assistant'; parts: Part[] } | { role: 'notice'; text: string; tone: string }
+export type Item = { role: 'user'; text: string; messageIndex?: number; attached?: Omit<SentItem, 'content' | 'unchanged'>[] } | { role: 'assistant'; parts: Part[] } | { role: 'notice'; text: string; tone: string }
 
 export interface Call {
   id: string
@@ -83,7 +84,7 @@ export function useChat(conversation: string | null, { picked, fallback, offered
       })
       .catch((e: CmsError) => {
         if (canceled) return
-        if (e.status === 404) panel.select(null)
+        if (e.status === 404) panel.deleted(conversation)
         else setError(e.message)
       })
       .finally(() => !canceled && setLoading(false))
@@ -126,11 +127,17 @@ export function useChat(conversation: string | null, { picked, fallback, offered
     let mutated = false
     let accepted = false
     const model = turnModel.current
+    // How a chat starts names it.
+    const starts = typeof body.message === 'string' && (!current.current || (body.edit as { index?: number } | undefined)?.index === 0)
 
     try {
+      // Only what someone says carries the page; deciding and clicking go on from there.
+      if (body.edit) forget(current.current)
+      const page = typeof body.message === 'string' ? await messageContext(current.current) : null
+      if (controller.signal.aborted) return false
       await eventStream(
         'assistant/chat',
-        { conversation: current.current, model, ...body, context: { path: panel.get().contextPath } },
+        { conversation: current.current, model, ...body, context: page?.context },
         (event, data) => {
           if (controller.signal.aborted || abort.current !== controller) return
           switch (event) {
@@ -140,7 +147,7 @@ export function useChat(conversation: string | null, { picked, fallback, offered
               setItems((list) => {
                 const index = edit ? list.findIndex((item) => item.role === 'user' && item.messageIndex === edit.index) : list.findLastIndex((item) => item.role === 'user')
                 if (index < 0) return list
-                return [...list.slice(0, index), { role: 'user', text: data.text, messageIndex: data.messageIndex }, ...(edit ? [] : list.slice(index + 1))]
+                return [...list.slice(0, index), { role: 'user', text: data.text, messageIndex: data.messageIndex, attached: data.attached }, ...(edit ? [] : list.slice(index + 1))]
               })
               if (edit) { setAwaiting([]); onAccepted?.() }
               break
@@ -149,6 +156,7 @@ export function useChat(conversation: string | null, { picked, fallback, offered
               // The server took the turn, and with it the model it runs on.
               if (model) setSaved(model)
               current.current = data.id
+              page?.carry(data.id)
               working = { conversation: data.id, title: data.title }
               panel.set({ working })
               setTitle(data.title)
@@ -165,7 +173,11 @@ export function useChat(conversation: string | null, { picked, fallback, offered
             case 'tool_result':
               patchTool(data.id, { status: data.declined ? 'declined' : data.ok ? 'ok' : 'error', output: data.output, input: data.input, surface: data.surface ?? undefined })
               mutated ||= data.mutated
-              if (data.mutated) void queryClient.invalidateQueries()
+              if (data.mutated) {
+                void queryClient.invalidateQueries()
+                // An open editor shows what just changed.
+                events.emit('content.changed')
+              }
               break
             case 'surface_used':
               patchTool(data.id, { used: true })
@@ -205,9 +217,22 @@ export function useChat(conversation: string | null, { picked, fallback, offered
       }
       if (mutated) void queryClient.invalidateQueries()
       void queryClient.invalidateQueries({ queryKey: ['assistant/conversations'] })
+      if (starts && current.current) void nameChat(current.current)
     }
     return accepted
   }, [])
+
+  /** On the small model, after the first reply; until then the chat goes by its first words. */
+  const nameChat = async (id: string) => {
+    try {
+      const { title: named } = await run<{ title: string }>('assistant/conversation-title', { id })
+      if (current.current === id) {
+        setTitle(named)
+        panel.set({ title: named })
+      }
+      void queryClient.invalidateQueries({ queryKey: ['assistant/conversations'] })
+    } catch { /* It keeps the name it has. */ }
+  }
 
   const edit = useCallback((item: Extract<Item, { role: 'user' }>, text: string, onAccepted?: () => void) => {
     if (abort.current || loading || !current.current || item.messageIndex === undefined || !text.trim()) return Promise.resolve(false)
