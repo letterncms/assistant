@@ -19,6 +19,7 @@ function d() {
 }
 var f = /* @__PURE__ */ new Set(), p = {
 	...d(),
+	thread: 0,
 	history: !1,
 	title: "",
 	prompt: null,
@@ -108,11 +109,10 @@ var T = {
 		}));
 	},
 	newChat() {
-		let e = p.drafts[p.conversation ?? "new"]?.trim() ? p.conversation : null;
-		T.select(e);
+		p.working?.conversation !== null && T.set({ thread: p.thread + 1 }), T.select(null);
 	},
 	ask(e) {
-		T.newChat(), e?.trim() && T.set({ prompt: e.trim() });
+		p.drafts[p.conversation ?? "new"]?.trim() ? T.select(p.conversation) : T.newChat(), e?.trim() && T.set({ prompt: e.trim() });
 	},
 	draft(e) {
 		T.set({ drafts: {
